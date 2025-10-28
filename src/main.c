@@ -144,9 +144,9 @@ void app_main(void) {
     motor_set(LEDC_CHANNEL_1, PIN_MB2, 0);
 
     /* Simple line-follow demo */
-    int base = 700;        // 0..1023
-    int kP   = 120;        // steering gain
-    int threshold = 1800;  // tune for your surface
+    int base = 500;        // 0..1023
+    int kP   = 100;        // steering gain
+    int threshold = 1500;  // tune for your surface
 
     while (1) {
         uint8_t bits[8] = {0};
