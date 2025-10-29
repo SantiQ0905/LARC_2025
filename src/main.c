@@ -2,76 +2,152 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h"
+#include "esp_err.h"
 
-/* -------- Tag -------- */
-static const char *TAG = "Motor-Test";
+// --- NEW ADC one-shot driver (ESP-IDF v5+) ---
+#include "esp_adc/adc_oneshot.h"
 
-/* -------- Pin map -------- */
-#define PIN_MA1     18     // Motor A PWM
-#define PIN_MA2     19     // Motor A DIR
-#define PIN_MB1     20     // Motor B PWM
-#define PIN_MB2     21     // Motor B DIR
+static const char *TAG = "Sensor-Test";
 
-/* LEDC motor control: speed [-1023..1023] */
-static void motor_set(ledc_channel_t pwm_chan, gpio_num_t pin_dir, int speed) {
-    if (speed >= 0) {
-        gpio_set_level(pin_dir, 0);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, pwm_chan, speed);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, pwm_chan);
-    } else {
-        gpio_set_level(pin_dir, 1);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, pwm_chan, -speed);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, pwm_chan);
+/* ---------- Pin map (from your table) ---------- */
+#define PIN_MUX_S0   4
+#define PIN_MUX_S1   5
+#define PIN_MUX_S2   0
+#define PIN_MUX_Y    1   // ADC input
+
+#define PIN_ENCA1    2   // Left encoder A
+#define PIN_ENCA2    3   // Left encoder B
+#define PIN_ENCB1    23  // Right encoder A
+#define PIN_ENCB2    22  // Right encoder B
+
+/* ---------- Line sensor config ---------- */
+#define NUM_LINE_CH   8
+#define LINE_SETTLE_MS 2           // allow MUX/ADC to settle
+#define LINE_THRESH   1800         // tune: ~12-bit ADC raw midpoint (0..~4095)
+
+/* ---------- Encoder sampling ---------- */
+typedef struct {
+    gpio_num_t pinA;
+    gpio_num_t pinB;
+    int32_t count;
+    int lastA;
+} quad_t;
+
+static quad_t enc_left  = { .pinA = PIN_ENCA1, .pinB = PIN_ENCA2, .count = 0, .lastA = 0 };
+static quad_t enc_right = { .pinA = PIN_ENCB1, .pinB = PIN_ENCB2, .count = 0, .lastA = 0 };
+
+/* ---------- Globals ---------- */
+static adc_oneshot_unit_handle_t adc1;
+static adc_channel_t adc_chan_muxY = ADC_CHANNEL_1; // GPIO1 on ESP32-C6
+
+/* ---------- Helpers ---------- */
+static inline void mux_select(uint8_t ch) {
+    gpio_set_level(PIN_MUX_S0, (ch >> 0) & 1);
+    gpio_set_level(PIN_MUX_S1, (ch >> 1) & 1);
+    gpio_set_level(PIN_MUX_S2, (ch >> 2) & 1);
+}
+
+static int read_mux_channel(uint8_t ch) {
+    mux_select(ch);
+    vTaskDelay(pdMS_TO_TICKS(LINE_SETTLE_MS));
+    int raw = 0;
+    esp_err_t err = adc_oneshot_read(adc1, adc_chan_muxY, &raw);
+    if (err != ESP_OK) raw = -1;
+    return raw;
+}
+
+static void encoder_sample(quad_t *e) {
+    int a = gpio_get_level(e->pinA);
+    int b = gpio_get_level(e->pinB);
+    // Count on rising edge of A; direction decided by B
+    if (e->lastA == 0 && a == 1) {
+        if (b == 0) e->count++;    // one direction
+        else        e->count--;    // opposite direction
+    }
+    e->lastA = a;
+}
+
+/* ---------- Tasks ---------- */
+static void task_line_sensors(void *_) {
+    ESP_LOGI(TAG, "Line sensor scan started");
+    int raw[NUM_LINE_CH];
+    int bin[NUM_LINE_CH];
+
+    while (1) {
+        for (int ch = 0; ch < NUM_LINE_CH; ch++) {
+            raw[ch] = read_mux_channel(ch);
+            // NOTE: depending on your array, black may be LOW or HIGH.
+            // If inverted, flip the comparison.
+            bin[ch] = (raw[ch] < LINE_THRESH) ? 1 : 0;
+        }
+
+        // Pretty print
+        printf("RAW: ");
+        for (int i = 0; i < NUM_LINE_CH; i++) {
+            printf("%4d%s", raw[i], (i == NUM_LINE_CH-1) ? "  " : ",");
+        }
+        printf(" BIN: [");
+        for (int i = 0; i < NUM_LINE_CH; i++) {
+            printf("%d%s", bin[i], (i == NUM_LINE_CH-1) ? "" : " ");
+        }
+        printf("]\n");
+
+        vTaskDelay(pdMS_TO_TICKS(200)); // ~5 Hz
+    }
+}
+
+static void task_encoders(void *_) {
+    ESP_LOGI(TAG, "Encoder sampling started");
+    // Init lastA for edge detection
+    enc_left.lastA  = gpio_get_level(enc_left.pinA);
+    enc_right.lastA = gpio_get_level(enc_right.pinA);
+
+    while (1) {
+        encoder_sample(&enc_left);
+        encoder_sample(&enc_right);
+
+        static TickType_t lastPrint = 0;
+        TickType_t now = xTaskGetTickCount();
+        if (now - lastPrint > pdMS_TO_TICKS(250)) {
+            lastPrint = now;
+            printf("ENC L: %ld   ENC R: %ld\n", (long)enc_left.count, (long)enc_right.count);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2)); // ~500 Hz sampling
     }
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "Motor Test Starting");
+    ESP_LOGI(TAG, "Sensors Test - starting…");
 
-    /* GPIO outputs for motor direction pins */
-    gpio_config_t out_cfg = {
+    /* --- GPIO: MUX select lines as outputs --- */
+    gpio_config_t mux_cfg = {
         .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL<<PIN_MA2) | (1ULL<<PIN_MB2)
+        .pin_bit_mask = (1ULL<<PIN_MUX_S0) | (1ULL<<PIN_MUX_S1) | (1ULL<<PIN_MUX_S2),
+        .pull_down_en = 0, .pull_up_en = 0, .intr_type = GPIO_INTR_DISABLE
     };
-    gpio_config(&out_cfg);
+    ESP_ERROR_CHECK(gpio_config(&mux_cfg));
+    mux_select(0);
 
-    /* LEDC PWM: 20 kHz, 10-bit */
-    ledc_timer_config_t tcfg = {
-        .speed_mode      = LEDC_LOW_SPEED_MODE,
-        .timer_num       = LEDC_TIMER_0,
-        .freq_hz         = 20000,
-        .clk_cfg         = LEDC_AUTO_CLK,
-        .duty_resolution = LEDC_TIMER_10_BIT
+    /* --- GPIO: Encoders as inputs with pull-ups --- */
+    gpio_config_t enc_cfg = {
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL<<PIN_ENCA1) | (1ULL<<PIN_ENCA2) | (1ULL<<PIN_ENCB1) | (1ULL<<PIN_ENCB2),
+        .pull_up_en = 1, .pull_down_en = 0, .intr_type = GPIO_INTR_DISABLE
     };
-    ESP_ERROR_CHECK(ledc_timer_config(&tcfg));
+    ESP_ERROR_CHECK(gpio_config(&enc_cfg));
 
-    ledc_channel_config_t chA = {
-        .gpio_num   = PIN_MA1,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel    = LEDC_CHANNEL_0,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .timer_sel  = LEDC_TIMER_0,
-        .duty       = 0
+    /* --- ADC one-shot on GPIO1 (MUX_Y) --- */
+    adc_oneshot_unit_init_cfg_t init = { .unit_id = ADC_UNIT_1 };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init, &adc1));
+
+    adc_oneshot_chan_cfg_t ch_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,  // use default for chip
+        .atten    = ADC_ATTEN_DB_11        // ~0-3.3V range
     };
-    ledc_channel_config_t chB = chA;
-    chB.gpio_num = PIN_MB1;
-    chB.channel  = LEDC_CHANNEL_1;
-    ESP_ERROR_CHECK(ledc_channel_config(&chA));
-    ESP_ERROR_CHECK(ledc_channel_config(&chB));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1, adc_chan_muxY, &ch_cfg));
 
-    /* Simple forward/backward test */
-    while (1) {
-        // Forward for 5 seconds
-        ESP_LOGI(TAG, "FORWARD");
-        motor_set(LEDC_CHANNEL_0, PIN_MA2, -700);  // Left motor inverted
-        motor_set(LEDC_CHANNEL_1, PIN_MB2, 700);
-        vTaskDelay(pdMS_TO_TICKS(5000));
-
-        // Backward for 5 seconds
-        ESP_LOGI(TAG, "BACKWARD");
-        motor_set(LEDC_CHANNEL_0, PIN_MA2, 700);   // Left motor inverted
-        motor_set(LEDC_CHANNEL_1, PIN_MB2, -700);
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
+    /* --- Launch tasks --- */
+    xTaskCreate(task_line_sensors, "line_sensors", 4096, NULL, 5, NULL);
+    xTaskCreate(task_encoders,    "encoders",     4096, NULL, 5, NULL);
 }
