@@ -64,18 +64,19 @@ static httpd_handle_t server = NULL;
 #define CURVE_PUSH_SPEED   850
 #define CURVE_INNER_SPEED  300
 
-/* ===== STOP DETECTION PARAMS ===== */
+/* ===== STOP DETECTION ===== */
 #define STOP_BLACK_MIN           7
-#define STOP_CONSEC_IN_SLOW     40   // ~180 ms (@ 5 ms loop)
-#define STOP_CONSEC_IN_NORMAL   22   // ~95 ms
-#define STOP_CONSEC_IN_FAST     15   // ~65 ms
-#define STOP_CONSEC_IN_TURBO    10   // ~40 ms
+#define STOP_CONSEC_IN_SLOW     36
+#define STOP_CONSEC_IN_NORMAL   22
+#define STOP_CONSEC_IN_FAST     15
+#define STOP_CONSEC_IN_TURBO    10
 #define STOP_CONSEC_OUT          8
 #define STOP_HOLD_MS           700
 #define STOP_CREEP_SPEED       350
-#define STOP_COOLDOWN_TICKS    160   // ~800 ms
+#define STOP_COOLDOWN_TICKS    150
 
 typedef enum { ST_FOLLOW=0, ST_BRAKE, ST_HOLD, ST_CREEP, ST_COOLDOWN } stop_state_t;
+
 
 /* ===== GAP RECOVERY (DOTTED LINE) ===== */
 typedef enum { GAP_NONE=0, GAP_COAST, GAP_SWEEP } gap_state_t;
@@ -117,12 +118,13 @@ static void motor_set(ledc_channel_t pwm_chan, gpio_num_t pin_dir, int speed) {
 static inline void soft_brake(ledc_channel_t chL, gpio_num_t dirL,
                               ledc_channel_t chR, gpio_num_t dirR,
                               int *pL, int *pR) {
-    for (int i = 0; i < 12; i++) {
-        *pL = (*pL * 7) / 10;
-        *pR = (*pR * 7) / 10;
+    // More aggressive braking: fewer iterations, faster decay
+    for (int i = 0; i < 8; i++) {
+        *pL = (*pL * 5) / 10;  // 50% decay per step (was 70%)
+        *pR = (*pR * 5) / 10;
         motor_set(chL, dirL, *pL);
         motor_set(chR, dirR, *pR);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(5));  // 5ms per step (was 10ms)
     }
     *pL = 0; *pR = 0;
     motor_set(chL, dirL, 0);
