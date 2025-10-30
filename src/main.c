@@ -1,3 +1,6 @@
+// 1st run - 100 pts
+// 2nd run - 90 pts
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
