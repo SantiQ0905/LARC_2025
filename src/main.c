@@ -66,10 +66,10 @@ static httpd_handle_t server = NULL;
 
 /* ===== STOP DETECTION PARAMS ===== */
 #define STOP_BLACK_MIN           7
-#define STOP_CONSEC_IN_SLOW     36   // ~180 ms (@ 5 ms loop)
-#define STOP_CONSEC_IN_NORMAL   19   // ~95 ms
-#define STOP_CONSEC_IN_FAST     13   // ~65 ms
-#define STOP_CONSEC_IN_TURBO     8   // ~40 ms
+#define STOP_CONSEC_IN_SLOW     40   // ~180 ms (@ 5 ms loop)
+#define STOP_CONSEC_IN_NORMAL   22   // ~95 ms
+#define STOP_CONSEC_IN_FAST     15   // ~65 ms
+#define STOP_CONSEC_IN_TURBO    10   // ~40 ms
 #define STOP_CONSEC_OUT          8
 #define STOP_HOLD_MS           700
 #define STOP_CREEP_SPEED       350
