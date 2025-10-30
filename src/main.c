@@ -5,26 +5,45 @@
 #include "driver/ledc.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_rom_sys.h"
-#include <inttypes.h>
 #include <stdbool.h>
+#include <string.h>
 
 static const char *TAG = "LFR-C6";
 
-/* -------- Pin map -------- */
+/* ========== Pines de tu PCB ========== */
 #define PIN_MUX_S0  4
 #define PIN_MUX_S1  5
 #define PIN_MUX_S2  0
-#define PIN_MUX_Y   1      // ADC input from MUX
+#define PIN_MUX_Y   1   // ADC1_CH1
 
-#define PIN_MA1     18     // Motor A PWM
-#define PIN_MA2     19     // Motor A DIR
-#define PIN_MB1     20     // Motor B PWM
-#define PIN_MB2     21     // Motor B DIR
+#define PIN_MA1     18  // PWM motor izq
+#define PIN_MA2     19  // DIR motor izq
+#define PIN_MB1     20  // PWM motor der
+#define PIN_MB2     21  // DIR motor der
 
-static inline void mux_select(uint8_t i) {
-    gpio_set_level(PIN_MUX_S0, i & 0x01);
-    gpio_set_level(PIN_MUX_S1, (i >> 1) & 0x01);
-    gpio_set_level(PIN_MUX_S2, (i >> 2) & 0x01);
+/* ========== Config general ========== */
+#define PWM_FREQ_HZ     20000
+#define PWM_RES_BITS    10
+#define PWM_MAX_DUTY    ((1 << PWM_RES_BITS) - 1)
+
+#define BASE_SPEED      650
+#define KP              120
+#define LINE_THRESHOLD  1500
+
+/* si un sensor no sirve: */
+#define IGNORE_SENSOR_1   1
+
+/* --- motor flip global --- 
+   1 = invierte los DOS motores
+   (porque tu compa los conectó al revés)
+*/
+#define INVERT_BOTH_MOTORS  0
+
+/* ========== Helpers ========== */
+static inline void mux_select(uint8_t ch) {
+    gpio_set_level(PIN_MUX_S0, (ch >> 0) & 1);
+    gpio_set_level(PIN_MUX_S1, (ch >> 1) & 1);
+    gpio_set_level(PIN_MUX_S2, (ch >> 2) & 1);
     esp_rom_delay_us(5);
 }
 
@@ -39,37 +58,46 @@ static void motor_set(ledc_channel_t pwm_chan, gpio_num_t pin_dir, int speed) {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, pwm_chan);
 }
 
+/* ========== MAIN ========== */
 void app_main(void) {
-    ESP_LOGI(TAG, "Boot");
+    ESP_LOGI(TAG, "Boot LFR");
 
-    /* GPIO outputs for MUX and motor dirs */
+    /* GPIO salidas */
     gpio_config_t out_cfg = {
         .mode = GPIO_MODE_OUTPUT,
         .pin_bit_mask =
-            (1ULL<<PIN_MUX_S0) | (1ULL<<PIN_MUX_S1) | (1ULL<<PIN_MUX_S2) |
-            (1ULL<<PIN_MA2)    | (1ULL<<PIN_MB2)
+            (1ULL << PIN_MUX_S0) |
+            (1ULL << PIN_MUX_S1) |
+            (1ULL << PIN_MUX_S2) |
+            (1ULL << PIN_MA2)    |
+            (1ULL << PIN_MB2),
+        .pull_up_en = 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&out_cfg);
 
-    /* --- ADC setup --- */
+    /* ADC one-shot */
     adc_oneshot_unit_handle_t adc1;
-    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = ADC_UNIT_1
+    };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc1));
 
-    adc_channel_t mux_y_ch = ADC_CHANNEL_1;
+    adc_channel_t adc_ch = ADC_CHANNEL_1;   // GPIO1
     adc_oneshot_chan_cfg_t ch_cfg = {
         .bitwidth = ADC_BITWIDTH_DEFAULT,
         .atten    = ADC_ATTEN_DB_12
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1, mux_y_ch, &ch_cfg));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1, adc_ch, &ch_cfg));
 
-    /* --- PWM setup --- */
+    /* PWM motores */
     ledc_timer_config_t tcfg = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .timer_num       = LEDC_TIMER_0,
-        .freq_hz         = 20000,
+        .freq_hz         = PWM_FREQ_HZ,
         .clk_cfg         = LEDC_AUTO_CLK,
-        .duty_resolution = LEDC_TIMER_10_BIT
+        .duty_resolution = PWM_RES_BITS
     };
     ESP_ERROR_CHECK(ledc_timer_config(&tcfg));
 
@@ -87,98 +115,100 @@ void app_main(void) {
     ESP_ERROR_CHECK(ledc_channel_config(&chA));
     ESP_ERROR_CHECK(ledc_channel_config(&chB));
 
-    /* --- Params --- */
-    int base_speed = 600;
-    int kP = 120;
-    int threshold = 1500;
-
-    // último giro (por si pierde la línea)
+    int weights[8] = { -3, -2, -1, 0, 0, 1, 2, 3 };
     int last_turn_dir = 1;
+    uint32_t tick = 0;
 
     while (1) {
-        uint8_t bits[8] = {0};
-        int raw[8] = {0};
+        int raw[8]  = {0};
+        int blk[8]  = {0};
 
-        // leer 8 sensores
+        /* 1) leer los 8 sensores */
         for (int i = 0; i < 8; i++) {
             mux_select(i);
             int v = 0, acc = 0;
             for (int s = 0; s < 3; s++) {
-                ESP_ERROR_CHECK(adc_oneshot_read(adc1, mux_y_ch, &v));
+                ESP_ERROR_CHECK(adc_oneshot_read(adc1, adc_ch, &v));
                 acc += v;
             }
             v = acc / 3;
             raw[i] = v;
-            // OJO: en tu pista el negro da BAJO, el blanco ALTO → ajusta si es al revés
-            bits[i] = (v < threshold) ? 1 : 0;  // 1 = negro
+
+            int is_black = (v < LINE_THRESHOLD) ? 1 : 0;
+            if (IGNORE_SENSOR_1 && i == 1) {
+                is_black = 0;
+            }
+            blk[i] = is_black;
         }
 
-        // pesos, pero vamos a ignorar 0 y 7 a menos que no haya nada más
-        int weights[8] = {-3,-2,-1,0,0,1,2,3};
+        /* 2) lógica de seguimiento */
+        bool centerL = blk[3];
+        bool centerR = blk[4];
 
-        bool cL = bits[3];
-        bool cR = bits[4];
+        int left_cmd = 0;
+        int right_cmd = 0;
 
-        int left = 0, right = 0;
-
-        if (cL && cR) {
-            // línea justo en el centro → ir derecho
-            left = base_speed;
-            right = base_speed;
-        } else if (cL && !cR) {
-            // un poco cargado a la izquierda → corregir derecha suave
-            left = base_speed / 2;
-            right = base_speed;
+        if (centerL && centerR) {
+            // bien en el centro
+            left_cmd  = BASE_SPEED;
+            right_cmd = BASE_SPEED;
+        } else if (centerL && !centerR) {
+            // un poco a la izq → corrige derecha
+            left_cmd  = (BASE_SPEED * 3) / 4;   // no lo frenes tanto
+            right_cmd = BASE_SPEED;
             last_turn_dir = -1;
-        } else if (!cL && cR) {
-            // un poco cargado a la derecha → corregir izquierda suave
-            left = base_speed;
-            right = base_speed / 2;
+        } else if (!centerL && centerR) {
+            // un poco a la der → corrige izq
+            left_cmd  = BASE_SPEED;
+            right_cmd = (BASE_SPEED * 3) / 4;
             last_turn_dir = 1;
         } else {
-            // centros no ven nada
-            // ¿hay algo en 1..6?
+            // centros no ven
             int sum_mid = 0, act_mid = 0;
-            for (int i = 1; i <= 6; i++) {   // <--- ignoramos extremos aquí
-                if (bits[i]) {
+            for (int i = 1; i <= 6; i++) {
+                if (blk[i]) {
                     sum_mid += weights[i];
                     act_mid++;
                 }
             }
 
             if (act_mid > 0) {
-                // usar el proporcional pero SOLO con los sensores 1..6
-                int err = sum_mid;       // ya está ponderado
-                int turn = kP * err;
-                left  = base_speed - turn;
-                right = base_speed + turn;
+                int err  = sum_mid;
+                int turn = KP * err;
+                left_cmd  = BASE_SPEED - turn;
+                right_cmd = BASE_SPEED + turn;
                 last_turn_dir = (err >= 0) ? 1 : -1;
             } else {
-                // solo hay extremos (0 o 7) o nada → NO los persigas duro
-                // mejor gira despacito hacia la última dirección buena
-                left  = 300 * last_turn_dir;
-                right = -300 * last_turn_dir;
+                // solo extremos o nada → buscar
+                left_cmd  = 300 * last_turn_dir;
+                right_cmd = -300 * last_turn_dir;
             }
         }
 
-        // clamp
-        if (left > 1023) left = 1023;
-        if (left < -1023) left = -1023;
-        if (right > 1023) right = 1023;
-        if (right < -1023) right = -1023;
+        /* 3) clamp */
+        if (left_cmd > PWM_MAX_DUTY)  left_cmd = PWM_MAX_DUTY;
+        if (left_cmd < -PWM_MAX_DUTY) left_cmd = -PWM_MAX_DUTY;
+        if (right_cmd > PWM_MAX_DUTY) right_cmd = PWM_MAX_DUTY;
+        if (right_cmd < -PWM_MAX_DUTY)right_cmd = -PWM_MAX_DUTY;
 
-        // IMPORTANTE: aquí ya NO invertimos el derecho
-        motor_set(LEDC_CHANNEL_0, PIN_MA2, left);
-        motor_set(LEDC_CHANNEL_1, PIN_MB2, right);
+        /* 4) aplicar motores
+              aquí invertimos los DOS porque ya nos dijiste que tu amigo los volteó
+        */
+        if (INVERT_BOTH_MOTORS) {
+            motor_set(LEDC_CHANNEL_0, PIN_MA2, -left_cmd);
+            motor_set(LEDC_CHANNEL_1, PIN_MB2, -right_cmd);
+        } else {
+            motor_set(LEDC_CHANNEL_0, PIN_MA2, left_cmd);
+            motor_set(LEDC_CHANNEL_1, PIN_MB2, right_cmd);
+        }
 
-        static uint32_t tick = 0;
+        /* 5) debug */
         if (++tick % 50 == 0) {
-            ESP_LOGI(TAG, "bits=%d%d%d%d%d%d%d%d  L=%d R=%d  raw=%d,%d,%d,%d,%d,%d,%d,%d",
-                     bits[0],bits[1],bits[2],bits[3],
-                     bits[4],bits[5],bits[6],bits[7],
-                     left, right,
-                     raw[0],raw[1],raw[2],raw[3],
-                     raw[4],raw[5],raw[6],raw[7]);
+            ESP_LOGI(TAG,
+                     "blk=[%d %d %d %d %d %d %d %d] raw=[%4d %4d %4d %4d %4d %4d %4d %4d] L=%d R=%d",
+                     blk[0],blk[1],blk[2],blk[3],blk[4],blk[5],blk[6],blk[7],
+                     raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7],
+                     left_cmd, right_cmd);
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
