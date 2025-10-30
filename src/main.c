@@ -49,12 +49,16 @@ static const char *TAG = "LFR-C6";
 #define CURVE_INNER_SPEED  300   // cuánto frenar la rueda interna
 
 /* ===== STOP detection params ===== */
-#define STOP_BLACK_MIN          7
-#define STOP_CONSEC_IN          18      // ~90 ms @ 5 ms loop
+#define STOP_BLACK_MIN           7
+/* NOTE: We now use per-mode arming windows instead of the fixed STOP_CONSEC_IN. */
+#define STOP_CONSEC_IN_SLOW     36   // ~180 ms (@ 5 ms loop)
+#define STOP_CONSEC_IN_NORMAL   24   // ~120 ms
+#define STOP_CONSEC_IN_FAST     18   // ~90 ms
+#define STOP_CONSEC_IN_TURBO    12   // ~60 ms
 #define STOP_CONSEC_OUT          8
 #define STOP_HOLD_MS           700
 #define STOP_CREEP_SPEED       350
-#define STOP_COOLDOWN_TICKS    160      // ~800 ms
+#define STOP_COOLDOWN_TICKS    160   // ~800 ms
 
 typedef enum { ST_FOLLOW=0, ST_BRAKE, ST_HOLD, ST_CREEP, ST_COOLDOWN } stop_state_t;
 
@@ -160,14 +164,25 @@ void app_main(void) {
     ESP_ERROR_CHECK(ledc_channel_config(&chA));
     ESP_ERROR_CHECK(ledc_channel_config(&chB));
 
-    /* modo */
+    /* modo + per-mode STOP arming window */
     int dip1 = gpio_get_level(PIN_DIP_1);
     int dip2 = gpio_get_level(PIN_DIP_2);
     int BASE_SPEED, KP;
-    if (dip1 == 1 && dip2 == 1) { BASE_SPEED = MODE_SLOW_BASE_SPEED;   KP = MODE_SLOW_KP; }
-    else if (dip1 == 0 && dip2 == 1) { BASE_SPEED = MODE_NORMAL_BASE_SPEED; KP = MODE_NORMAL_KP; }
-    else if (dip1 == 1 && dip2 == 0) { BASE_SPEED = MODE_FAST_BASE_SPEED;   KP = MODE_FAST_KP; }
-    else { BASE_SPEED = MODE_TURBO_BASE_SPEED; KP = MODE_TURBO_KP; }
+    int stop_consec_in;  // NEW: per-mode arming cycles
+
+    if (dip1 == 1 && dip2 == 1) {
+        BASE_SPEED = MODE_SLOW_BASE_SPEED;   KP = MODE_SLOW_KP;
+        stop_consec_in = STOP_CONSEC_IN_SLOW;
+    } else if (dip1 == 0 && dip2 == 1) {
+        BASE_SPEED = MODE_NORMAL_BASE_SPEED; KP = MODE_NORMAL_KP;
+        stop_consec_in = STOP_CONSEC_IN_NORMAL;
+    } else if (dip1 == 1 && dip2 == 0) {
+        BASE_SPEED = MODE_FAST_BASE_SPEED;   KP = MODE_FAST_KP;
+        stop_consec_in = STOP_CONSEC_IN_FAST;
+    } else {
+        BASE_SPEED = MODE_TURBO_BASE_SPEED;  KP = MODE_TURBO_KP;
+        stop_consec_in = STOP_CONSEC_IN_TURBO;
+    }
 
     bool running = false;
     bool last_btn = true;
@@ -223,7 +238,7 @@ void app_main(void) {
             case ST_FOLLOW:
                 if (cooldown == 0) {
                     if (black_count_raw >= STOP_BLACK_MIN) {
-                        if (++stop_in_ctr >= STOP_CONSEC_IN) {
+                        if (++stop_in_ctr >= stop_consec_in) {  // <-- per-mode window
                             stop_in_ctr = 0;
                             st = ST_BRAKE;
                         }
