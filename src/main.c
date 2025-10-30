@@ -7,8 +7,24 @@
 #include "esp_rom_sys.h"
 #include <stdbool.h>
 #include <string.h>
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
 
 static const char *TAG = "LFR-C6";
+
+/* ========== WIFI CONFIG ========== */
+#define WIFI_SSID       "SpeedBird_LFR"
+#define WIFI_PASS       "speedbird123"
+#define WIFI_CHANNEL    1
+#define MAX_STA_CONN    4
+
+/* Global telemetry buffer for WiFi transmission */
+static char telemetry_buffer[256] = {0};
+static bool telemetry_updated = false;
+static httpd_handle_t server = NULL;
 
 /* ========== PINS ========== */
 #define PIN_MUX_S0  4
@@ -115,9 +131,163 @@ static inline void soft_brake(ledc_channel_t chL, gpio_num_t dirL,
     motor_set(chR, dirR, 0);
 }
 
+/* ========== WIFI & HTTP SERVER ========== */
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data) {
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "Station joined, AID=%d", event->aid);
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "Station left, AID=%d", event->aid);
+    }
+}
+
+static void wifi_init_softap(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .channel = WIFI_CHANNEL,
+            .password = WIFI_PASS,
+            .max_connection = MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .required = false,
+            },
+        },
+    };
+    
+    if (strlen(WIFI_PASS) == 0) {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi AP started. SSID:%s password:%s channel:%d",
+             WIFI_SSID, WIFI_PASS, WIFI_CHANNEL);
+}
+
+/* HTTP handlers */
+static esp_err_t root_get_handler(httpd_req_t *req) {
+    const char* html = 
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+        "<title>ESP32 LFR Telemetry</title>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;margin:20px;background:#1a1a1a;color:#fff;}"
+        "h1{color:#4CAF50;}#data{font-size:18px;margin:20px 0;}"
+        ".sensor{display:inline-block;width:40px;height:40px;margin:5px;"
+        "border:2px solid #333;text-align:center;line-height:40px;border-radius:5px;}"
+        ".white{background:#fff;color:#000;}.black{background:#000;color:#fff;}"
+        "#status{margin:10px 0;padding:10px;background:#333;border-radius:5px;}"
+        "</style></head><body>"
+        "<h1>ESP32 Line Follower Robot</h1>"
+        "<div id='status'>Connecting...</div>"
+        "<h2>Sensor Array (0=Black, 1=White)</h2>"
+        "<div id='sensors'></div>"
+        "<div id='data'>Waiting for data...</div>"
+        "<script>"
+        "function update(){"
+        "fetch('/telemetry').then(r=>r.text()).then(d=>{"
+        "document.getElementById('data').innerHTML='<pre>'+d+'</pre>';"
+        "var vals=d.match(/\\d/g);"
+        "if(vals&&vals.length>=8){"
+        "var html='';"
+        "for(var i=0;i<8;i++){"
+        "var cls=vals[i]=='1'?'white':'black';"
+        "html+='<div class=\"sensor '+cls+'\">'+vals[i]+'</div>';"
+        "}"
+        "document.getElementById('sensors').innerHTML=html;"
+        "document.getElementById('status').innerHTML='Connected - Live Data';"
+        "}"
+        "}).catch(e=>{"
+        "document.getElementById('status').innerHTML='Connection Error';"
+        "});}"
+        "setInterval(update,100);"
+        "</script></body></html>";
+    
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t telemetry_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, telemetry_buffer, strlen(telemetry_buffer));
+    return ESP_OK;
+}
+
+static httpd_handle_t start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.lru_purge_enable = true;
+    
+    httpd_handle_t srv = NULL;
+    
+    if (httpd_start(&srv, &config) == ESP_OK) {
+        httpd_uri_t root = {
+            .uri       = "/",
+            .method    = HTTP_GET,
+            .handler   = root_get_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(srv, &root);
+        
+        httpd_uri_t telemetry = {
+            .uri       = "/telemetry",
+            .method    = HTTP_GET,
+            .handler   = telemetry_get_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(srv, &telemetry);
+        
+        ESP_LOGI(TAG, "Web server started. Access at http://192.168.4.1");
+        return srv;
+    }
+    
+    ESP_LOGI(TAG, "Error starting server!");
+    return NULL;
+}
+
+/* Update telemetry for both serial and WiFi */
+static inline void update_telemetry(int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    snprintf(telemetry_buffer, sizeof(telemetry_buffer), 
+             "%d %d %d %d %d %d %d %d", s0, s1, s2, s3, s4, s5, s6, s7);
+    ESP_LOGI(TAG, "%s", telemetry_buffer);
+    telemetry_updated = true;
+}
+
 /* ========== MAIN ========== */
 void app_main(void) {
-    ESP_LOGI(TAG, "Boot LFR (Adaptive PD + STOP + GAP)");
+    ESP_LOGI(TAG, "Boot LFR (Adaptive PD + STOP + GAP + WiFi)");
+
+    /* Initialize NVS for WiFi */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    /* Initialize WiFi AP */
+    wifi_init_softap();
+    
+    /* Start HTTP Server */
+    server = start_webserver();
 
     /* GPIO OUTPUT */
     gpio_config_t out_cfg = {
@@ -290,9 +460,8 @@ void app_main(void) {
 
                 vTaskDelay(pdMS_TO_TICKS(5));
                 if (++tick % 10 == 0) {
-                    ESP_LOGI(TAG, "%d %d %d %d %d %d %d %d",
-                             telem_white[0], telem_white[1], telem_white[2], telem_white[3],
-                             telem_white[4], telem_white[5], telem_white[6], telem_white[7]);
+                    update_telemetry(telem_white[0], telem_white[1], telem_white[2], telem_white[3],
+                                     telem_white[4], telem_white[5], telem_white[6], telem_white[7]);
                 }
                 continue; 
             }
@@ -329,9 +498,8 @@ void app_main(void) {
             if (--gap_ctr <= 0) { gap = GAP_SWEEP; gap_sweep_ctr = GAP_SWEEP_MAX_TICKS; }
             vTaskDelay(pdMS_TO_TICKS(5));
             if (++tick % 10 == 0) {
-                ESP_LOGI(TAG, "%d %d %d %d %d %d %d %d",
-                         telem_white[0], telem_white[1], telem_white[2], telem_white[3],
-                         telem_white[4], telem_white[5], telem_white[6], telem_white[7]);
+                update_telemetry(telem_white[0], telem_white[1], telem_white[2], telem_white[3],
+                                 telem_white[4], telem_white[5], telem_white[6], telem_white[7]);
             }
             continue;
         } else if (gap == GAP_SWEEP) {
@@ -345,9 +513,8 @@ void app_main(void) {
             if (act > 0 || --gap_sweep_ctr <= 0) { gap = GAP_NONE; }
             vTaskDelay(pdMS_TO_TICKS(5));
             if (++tick % 10 == 0) {
-                ESP_LOGI(TAG, "%d %d %d %d %d %d %d %d",
-                         telem_white[0], telem_white[1], telem_white[2], telem_white[3],
-                         telem_white[4], telem_white[5], telem_white[6], telem_white[7]);
+                update_telemetry(telem_white[0], telem_white[1], telem_white[2], telem_white[3],
+                                 telem_white[4], telem_white[5], telem_white[6], telem_white[7]);
             }
             continue;
         }
@@ -410,9 +577,8 @@ void app_main(void) {
 
         /* TELEMETRY */
         if (++tick % 10 == 0) {
-            ESP_LOGI(TAG, "%d %d %d %d %d %d %d %d",
-                     telem_white[0], telem_white[1], telem_white[2], telem_white[3],
-                     telem_white[4], telem_white[5], telem_white[6], telem_white[7]);
+            update_telemetry(telem_white[0], telem_white[1], telem_white[2], telem_white[3],
+                             telem_white[4], telem_white[5], telem_white[6], telem_white[7]);
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
