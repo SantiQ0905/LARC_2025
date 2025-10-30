@@ -34,19 +34,19 @@ static const char *TAG = "LFR-C6";
 
 // Modos de velocidad basados en DIP switches
 // DIP1=OFF, DIP2=OFF -> Modo LENTO (Slow)
-#define MODE_SLOW_BASE_SPEED    450
+#define MODE_SLOW_BASE_SPEED    650
 #define MODE_SLOW_KP            80
 
 // DIP1=ON, DIP2=OFF -> Modo NORMAL
-#define MODE_NORMAL_BASE_SPEED  650
+#define MODE_NORMAL_BASE_SPEED  850
 #define MODE_NORMAL_KP          120
 
 // DIP1=OFF, DIP2=ON -> Modo RAPIDO (Fast)
-#define MODE_FAST_BASE_SPEED    800
+#define MODE_FAST_BASE_SPEED    950
 #define MODE_FAST_KP            140
 
 // DIP1=ON, DIP2=ON -> Modo TURBO
-#define MODE_TURBO_BASE_SPEED   950
+#define MODE_TURBO_BASE_SPEED   2000
 #define MODE_TURBO_KP           160
 
 #define LINE_THRESHOLD  1500
