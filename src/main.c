@@ -11,7 +11,7 @@
 #include <stdio.h>
 #include <math.h>
 
-static const char *TAG = "LFR_PID_V3";
+static const char *TAG = "LFR_PID_FAST";
 
 /* ---------- PINS ---------- */
 #define PIN_MUX_S0  4
@@ -35,19 +35,20 @@ static const char *TAG = "LFR_PID_V3";
 #define DT_MS           20
 
 /* Giro abierto cuando SOLO ve I0 */
-#define TURN_45_MS      230              // puedes volverlo a 250 si te funcionaba mejor
+#define TURN_45_MS      230
 #define TURN_SPEED      (PWM_MAX_DUTY * 9 / 10)
 
 /* ---------- SENSOR CONFIG ---------- */
 #define LINE_THRESHOLD      1650
-#define STOP_BLACK_MIN      7      // 7 u 8 sensores negros = cuadro STOP
-#define STOP_CONFIRM_COUNT  3      // lecturas seguidas para confirmar STOP final
+#define STOP_BLACK_MIN      7
+#define STOP_CONFIRM_COUNT  3
 
-/* ---------- MODOS / PID BASE ---------- */
-#define BASE_SPEED  950
-#define KP_BASE     135.0f
-#define KI_BASE     3.5f
-#define KD_BASE     60.0f
+/* ---------- VELOCIDAD / PID ---------- */
+/* SUBIMOS LA BASE */
+#define BASE_SPEED      1150        // antes 950
+#define KP_BASE         135.0f
+#define KI_BASE         3.5f
+#define KD_BASE         70.0f       // un poco más D porque vamos más rápido
 
 /* ---------- UART ---------- */
 #define UART_PORT_NUM   UART_NUM_1
@@ -55,7 +56,6 @@ static const char *TAG = "LFR_PID_V3";
 #define UART_RX_PIN     16
 #define UART_BAUD       115200
 
-/* ---------- ESTRUCTURA PID ---------- */
 typedef struct {
     float kP, kI, kD;
     float integral;
@@ -92,7 +92,6 @@ static void telemetry_send(int tick, float error, int left, int right, int black
     uart_write_bytes(UART_PORT_NUM, buf, n);
 }
 
-/* ---------- HELPERS ---------- */
 static inline void mux_select(uint8_t ch) {
     gpio_set_level(PIN_MUX_S0, (ch >> 0) & 1);
     gpio_set_level(PIN_MUX_S1, (ch >> 1) & 1);
@@ -117,7 +116,6 @@ static void motor_set(ledc_channel_t pwm_chan, gpio_num_t dir, int speed) {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, pwm_chan);
 }
 
-/* ---------- PID ---------- */
 static void pid_init(PID_t *p, float kp, float ki, float kd) {
     p->kP = kp;
     p->kI = ki;
@@ -128,7 +126,7 @@ static void pid_init(PID_t *p, float kp, float ki, float kd) {
 
 /* ===================================================== */
 void app_main(void) {
-    ESP_LOGI(TAG, "Starting Line Follower V3 (toggle + final STOP)");
+    ESP_LOGI(TAG, "Starting Line Follower V3 FAST (toggle + final STOP)");
 
     telemetry_init();
 
@@ -194,7 +192,6 @@ void app_main(void) {
     PID_t pid;
     pid_init(&pid, KP_BASE, KI_BASE, KD_BASE);
 
-    /* Vars de control */
     int base_speed   = BASE_SPEED;
     int weights[8]   = {-5, -3, -1, 0, 0, 1, 3, 5};
     float dt         = DT_MS / 1000.0f;
@@ -202,21 +199,17 @@ void app_main(void) {
     int stop_count   = 0;
     int last_dir     = 1;
 
-    /* toggle de botón */
-    bool running     = false;      // empieza parado
-    bool last_btn    = true;       // por pull-up
-    bool final_stop  = false;      // cuando ve el cuadro, ya no se mueve
+    bool running     = false;
+    bool last_btn    = true;
+    bool final_stop  = false;
 
     while (1) {
         /* ==== BOTÓN (toggle) ==== */
         bool btn_now = gpio_get_level(PIN_BUTTON);
-        if (last_btn && !btn_now) {         // flanco ↓
-            vTaskDelay(pdMS_TO_TICKS(40));  // debounce
+        if (last_btn && !btn_now) {
+            vTaskDelay(pdMS_TO_TICKS(40));
             if (gpio_get_level(PIN_BUTTON) == 0) {
-                if (final_stop) {
-                    // si ya estaba detenido por cuadro, botón lo resetea
-                    final_stop = false;
-                }
+                if (final_stop) final_stop = false;
                 running = !running;
                 ESP_LOGI(TAG, "BUTTON TOGGLE -> running=%d", running);
             }
@@ -226,7 +219,6 @@ void app_main(void) {
         }
         last_btn = btn_now;
 
-        /* si está parado o en stop final → motores 0 */
         if (!running || final_stop) {
             motor_set(LEDC_CHANNEL_0, PIN_MA2, 0);
             motor_set(LEDC_CHANNEL_1, PIN_MB2, 0);
@@ -252,17 +244,14 @@ void app_main(void) {
 
             if (blk[i]) {
                 int w = weights[i];
-                if (i == 0) {
-                    // sensor 0 muy agresivo
-                    w *= 2;
-                }
+                if (i == 0) w *= 2;    // sensor 0 agresivo
                 sum += w;
                 act++;
                 black_count++;
             }
         }
 
-        /* ===== STOP FINAL (cuadro negro) ===== */
+        /* ===== STOP FINAL ===== */
         if (black_count >= STOP_BLACK_MIN) {
             stop_count++;
         } else {
@@ -272,15 +261,13 @@ void app_main(void) {
         if (stop_count >= STOP_CONFIRM_COUNT) {
             ESP_LOGW(TAG, "FINAL STOP DETECTED → moving slightly forward into box");
 
-            int creep_speed   = 600;  // súbele si te quedas corto
-            int creep_time_ms = 800;  // 400–550 ms según tu chasis
+            int creep_speed   = 600;
+            int creep_time_ms = 800;
 
-            // avanzar dentro del cuadro
             motor_set(LEDC_CHANNEL_0, PIN_MA2, creep_speed);
             motor_set(LEDC_CHANNEL_1, PIN_MB2, creep_speed);
             vTaskDelay(pdMS_TO_TICKS(creep_time_ms));
 
-            // parar
             motor_set(LEDC_CHANNEL_0, PIN_MA2, 0);
             motor_set(LEDC_CHANNEL_1, PIN_MB2, 0);
 
@@ -291,18 +278,15 @@ void app_main(void) {
             continue;
         }
 
-        /* ===== CASO ESPECIAL: SOLO sensor 0 ===== */
+        /* ===== SOLO SENSOR 0 ===== */
         if (blk[0] && black_count == 1) {
             ESP_LOGW(TAG, "SHARP TURN: sensor0 only → spin to RIGHT");
             int ts = clamp_int(TURN_SPEED, 0, PWM_MAX_DUTY);
-            // izquierda atrás, derecha adelante → gira a la derecha
             motor_set(LEDC_CHANNEL_0, PIN_MA2, -ts);
             motor_set(LEDC_CHANNEL_1, PIN_MB2,  ts);
             vTaskDelay(pdMS_TO_TICKS(TURN_45_MS));
-            // stop corto
             motor_set(LEDC_CHANNEL_0, PIN_MA2, 0);
             motor_set(LEDC_CHANNEL_1, PIN_MB2, 0);
-            // reset PID
             pid.integral  = 0.0f;
             pid.prev_error = 0.0f;
             continue;
@@ -313,17 +297,17 @@ void app_main(void) {
         float error = -pos;
         last_dir    = (error > 0) ? 1 : -1;
 
-        /* ===== PID DINÁMICO ===== */
+        /* ===== PID DINÁMICO (más duro en alta) ===== */
         float kp_dynamic = KP_BASE;
         float kd_dynamic = KD_BASE;
 
-        if (fabsf(error) > 2.5f) {
-            kp_dynamic *= 1.2f;
-            kd_dynamic *= 1.4f;
+        if (fabsf(error) > 2.0f) {         // antes 2.5
+            kp_dynamic *= 1.25f;
+            kd_dynamic *= 1.45f;
         }
         if (fabsf(error) > 4.0f) {
-            kp_dynamic *= 1.4f;
-            kd_dynamic *= 1.6f;
+            kp_dynamic *= 1.5f;
+            kd_dynamic *= 1.7f;
         }
 
         /* PID core */
@@ -340,10 +324,10 @@ void app_main(void) {
         int R = clamp_int(base_speed + (int)correction,
                           -PWM_MAX_DUTY, PWM_MAX_DUTY);
 
-        // suaviza si ve poquitos
+        /* MENOS castigo cuando ve pocos sensores (porque vamos más rápido) */
         if (black_count <= 2) {
-            L = (int)(L * 0.85f);
-            R = (int)(R * 0.85f);
+            L = (int)(L * 0.92f);   // antes 0.85
+            R = (int)(R * 0.92f);
         }
 
         motor_set(LEDC_CHANNEL_0, PIN_MA2, L);
