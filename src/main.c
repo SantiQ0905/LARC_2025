@@ -1,4 +1,3 @@
-// LFR_PID_V3 - ajuste especial para curva izquierda (sensor I1 dañado)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -30,29 +29,48 @@ static const char *TAG = "LFR_PID_V3";
 #define PIN_DIP_2   7
 
 /* ---------- PWM ---------- */
-#define PWM_FREQ_HZ 20000
-#define PWM_RES_BITS 10
-#define PWM_MAX_DUTY ((1 << PWM_RES_BITS) - 1)
-#define DT_MS 20
+#define PWM_FREQ_HZ     20000
+#define PWM_RES_BITS    10
+#define PWM_MAX_DUTY    ((1 << PWM_RES_BITS) - 1)
+#define DT_MS           20
+
+/* Giro abierto cuando SOLO ve I0 */
+#define TURN_45_MS      230              // puedes volverlo a 250 si te funcionaba mejor
+#define TURN_SPEED      (PWM_MAX_DUTY * 9 / 10)
 
 /* ---------- SENSOR CONFIG ---------- */
-#define LINE_THRESHOLD 1650
-#define STOP_BLACK_MIN 7
-#define STOP_CONFIRM_COUNT 3
+#define LINE_THRESHOLD      1650
+#define STOP_BLACK_MIN      7      // 7 u 8 sensores negros = cuadro STOP
+#define STOP_CONFIRM_COUNT  3      // lecturas seguidas para confirmar STOP final
 
-/* ---------- MODOS ---------- */
+/* ---------- MODOS / PID BASE ---------- */
 #define BASE_SPEED  950
 #define KP_BASE     135.0f
 #define KI_BASE     3.5f
 #define KD_BASE     60.0f
 
 /* ---------- UART ---------- */
-#define UART_PORT_NUM UART_NUM_1
-#define UART_TX_PIN 17
-#define UART_RX_PIN 16
-#define UART_BAUD 115200
+#define UART_PORT_NUM   UART_NUM_1
+#define UART_TX_PIN     17
+#define UART_RX_PIN     16
+#define UART_BAUD       115200
 
-/* ---------- FUNCIONES AUX ---------- */
+/* ---------- ESTRUCTURA PID ---------- */
+typedef struct {
+    float kP, kI, kD;
+    float integral;
+    float prev_error;
+} PID_t;
+
+/* ---------- PROTOS ---------- */
+static void telemetry_init(void);
+static void telemetry_send(int tick, float error, int left, int right, int blacks);
+static inline void mux_select(uint8_t ch);
+static inline int clamp_int(int v, int lo, int hi);
+static void motor_set(ledc_channel_t pwm_chan, gpio_num_t dir, int speed);
+static void pid_init(PID_t *p, float kp, float ki, float kd);
+
+/* ---------- UART ---------- */
 static void telemetry_init(void) {
     const uart_config_t uart_config = {
         .baud_rate = UART_BAUD,
@@ -63,15 +81,18 @@ static void telemetry_init(void) {
     };
     uart_driver_install(UART_PORT_NUM, 2048, 0, 0, NULL, 0);
     uart_param_config(UART_PORT_NUM, &uart_config);
-    uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
 static void telemetry_send(int tick, float error, int left, int right, int blacks) {
     char buf[64];
-    int n = snprintf(buf, sizeof(buf), "%d,%.2f,%d,%d,%d\n", tick, error, left, right, blacks);
+    int n = snprintf(buf, sizeof(buf), "%d,%.2f,%d,%d,%d\n",
+                     tick, error, left, right, blacks);
     uart_write_bytes(UART_PORT_NUM, buf, n);
 }
 
+/* ---------- HELPERS ---------- */
 static inline void mux_select(uint8_t ch) {
     gpio_set_level(PIN_MUX_S0, (ch >> 0) & 1);
     gpio_set_level(PIN_MUX_S1, (ch >> 1) & 1);
@@ -97,83 +118,127 @@ static void motor_set(ledc_channel_t pwm_chan, gpio_num_t dir, int speed) {
 }
 
 /* ---------- PID ---------- */
-typedef struct {
-    float kP, kI, kD;
-    float integral;
-    float prev_error;
-} PID_t;
-
 static void pid_init(PID_t *p, float kp, float ki, float kd) {
-    p->kP = kp; p->kI = ki; p->kD = kd;
-    p->integral = 0.0f; p->prev_error = 0.0f;
+    p->kP = kp;
+    p->kI = ki;
+    p->kD = kd;
+    p->integral = 0.0f;
+    p->prev_error = 0.0f;
 }
 
-/* ---------- MAIN ---------- */
+/* ===================================================== */
 void app_main(void) {
-    ESP_LOGI(TAG, "Starting Line Follower V3 (fix sensor I1)");
+    ESP_LOGI(TAG, "Starting Line Follower V3 (toggle + final STOP)");
 
     telemetry_init();
 
-    // Config GPIO
+    /* GPIO salida */
     gpio_config_t out_cfg = {
         .mode = GPIO_MODE_OUTPUT,
         .pin_bit_mask =
-            (1ULL << PIN_MUX_S0) | (1ULL << PIN_MUX_S1) | (1ULL << PIN_MUX_S2) |
-            (1ULL << PIN_MA2) | (1ULL << PIN_MB2),
+            (1ULL << PIN_MUX_S0) |
+            (1ULL << PIN_MUX_S1) |
+            (1ULL << PIN_MUX_S2) |
+            (1ULL << PIN_MA2)    |
+            (1ULL << PIN_MB2),
+        .pull_up_en = 0
     };
     gpio_config(&out_cfg);
 
+    /* Entradas: botón y DIP */
     gpio_config_t in_cfg = {
         .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << PIN_BUTTON) | (1ULL << PIN_DIP_1) | (1ULL << PIN_DIP_2),
+        .pin_bit_mask =
+            (1ULL << PIN_BUTTON) |
+            (1ULL << PIN_DIP_1)  |
+            (1ULL << PIN_DIP_2),
         .pull_up_en = GPIO_PULLUP_ENABLE
     };
     gpio_config(&in_cfg);
 
-    // ADC
+    /* ADC */
     adc_oneshot_unit_handle_t adc1;
     adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
     adc_oneshot_new_unit(&unit_cfg, &adc1);
     adc_channel_t adc_ch = ADC_CHANNEL_1;
-    adc_oneshot_chan_cfg_t ch_cfg = { .bitwidth = ADC_BITWIDTH_DEFAULT, .atten = ADC_ATTEN_DB_12 };
+    adc_oneshot_chan_cfg_t ch_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten    = ADC_ATTEN_DB_12
+    };
     adc_oneshot_config_channel(adc1, adc_ch, &ch_cfg);
 
-    // PWM
+    /* PWM motores */
     ledc_timer_config_t tcfg = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .timer_num = LEDC_TIMER_0,
-        .freq_hz = PWM_FREQ_HZ,
-        .clk_cfg = LEDC_AUTO_CLK,
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .timer_num       = LEDC_TIMER_0,
+        .freq_hz         = PWM_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
         .duty_resolution = PWM_RES_BITS
     };
     ledc_timer_config(&tcfg);
 
     ledc_channel_config_t chA = {
-        .gpio_num = PIN_MA1, .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = LEDC_CHANNEL_0, .timer_sel = LEDC_TIMER_0
+        .gpio_num   = PIN_MA1,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LEDC_CHANNEL_0,
+        .timer_sel  = LEDC_TIMER_0,
+        .duty       = 0
     };
     ledc_channel_config_t chB = chA;
-    chB.gpio_num = PIN_MB1; chB.channel = LEDC_CHANNEL_1;
+    chB.gpio_num = PIN_MB1;
+    chB.channel  = LEDC_CHANNEL_1;
     ledc_channel_config(&chA);
     ledc_channel_config(&chB);
 
-    // PID inicial
+    /* PID */
     PID_t pid;
     pid_init(&pid, KP_BASE, KI_BASE, KD_BASE);
 
-    int base_speed = BASE_SPEED;
-    int weights[8] = {-6, -3, -1, 0, 0, 1, 3, 5}; // <- sensor 0 más fuerte (-6)
-    float dt = DT_MS / 1000.0f;
-    int tick = 0;
-    int stop_count = 0;
-    int last_dir = 1;
+    /* Vars de control */
+    int base_speed   = BASE_SPEED;
+    int weights[8]   = {-5, -3, -1, 0, 0, 1, 3, 5};
+    float dt         = DT_MS / 1000.0f;
+    int tick         = 0;
+    int stop_count   = 0;
+    int last_dir     = 1;
+
+    /* toggle de botón */
+    bool running     = false;      // empieza parado
+    bool last_btn    = true;       // por pull-up
+    bool final_stop  = false;      // cuando ve el cuadro, ya no se mueve
 
     while (1) {
+        /* ==== BOTÓN (toggle) ==== */
+        bool btn_now = gpio_get_level(PIN_BUTTON);
+        if (last_btn && !btn_now) {         // flanco ↓
+            vTaskDelay(pdMS_TO_TICKS(40));  // debounce
+            if (gpio_get_level(PIN_BUTTON) == 0) {
+                if (final_stop) {
+                    // si ya estaba detenido por cuadro, botón lo resetea
+                    final_stop = false;
+                }
+                running = !running;
+                ESP_LOGI(TAG, "BUTTON TOGGLE -> running=%d", running);
+            }
+            while (gpio_get_level(PIN_BUTTON) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        }
+        last_btn = btn_now;
+
+        /* si está parado o en stop final → motores 0 */
+        if (!running || final_stop) {
+            motor_set(LEDC_CHANNEL_0, PIN_MA2, 0);
+            motor_set(LEDC_CHANNEL_1, PIN_MB2, 0);
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        /* ===== LECTURA DE SENSORES ===== */
         int blk[8] = {0};
         int black_count = 0;
         int sum = 0, act = 0;
 
-        // Lectura sensores
         for (int i = 0; i < 8; i++) {
             mux_select(i);
             int val = 0;
@@ -184,65 +249,109 @@ void app_main(void) {
             }
             val /= 3;
             blk[i] = (val < LINE_THRESHOLD);
-            if (blk[i]) { sum += weights[i]; act++; black_count++; }
+
+            if (blk[i]) {
+                int w = weights[i];
+                if (i == 0) {
+                    // sensor 0 muy agresivo
+                    w *= 2;
+                }
+                sum += w;
+                act++;
+                black_count++;
+            }
         }
 
-        // Caso especial: solo I0 detecta
-        bool only_leftmost = (blk[0] && !(blk[1] || blk[2] || blk[3] || blk[4] || blk[5] || blk[6] || blk[7]));
-
-        // Stop seguro
+        /* ===== STOP FINAL (cuadro negro) ===== */
         if (black_count >= STOP_BLACK_MIN) {
             stop_count++;
-        } else stop_count = 0;
+        } else {
+            stop_count = 0;
+        }
 
         if (stop_count >= STOP_CONFIRM_COUNT) {
+            ESP_LOGW(TAG, "FINAL STOP DETECTED → moving slightly forward into box");
+
+            int creep_speed   = 600;  // súbele si te quedas corto
+            int creep_time_ms = 800;  // 400–550 ms según tu chasis
+
+            // avanzar dentro del cuadro
+            motor_set(LEDC_CHANNEL_0, PIN_MA2, creep_speed);
+            motor_set(LEDC_CHANNEL_1, PIN_MB2, creep_speed);
+            vTaskDelay(pdMS_TO_TICKS(creep_time_ms));
+
+            // parar
             motor_set(LEDC_CHANNEL_0, PIN_MA2, 0);
             motor_set(LEDC_CHANNEL_1, PIN_MB2, 0);
-            ESP_LOGW(TAG, "STOP: black sensors=%d", black_count);
-            vTaskDelay(pdMS_TO_TICKS(200));
-            stop_count = 0;
+
+            final_stop = true;
+            pid.integral  = 0.0f;
+            pid.prev_error = 0.0f;
+            vTaskDelay(pdMS_TO_TICKS(300));
             continue;
         }
 
-        // Cálculo error
-        float pos = (act > 0) ? ((float)sum / act) : 5 * last_dir;
-        float error = -pos;
-        last_dir = (error > 0) ? 1 : -1;
+        /* ===== CASO ESPECIAL: SOLO sensor 0 ===== */
+        if (blk[0] && black_count == 1) {
+            ESP_LOGW(TAG, "SHARP TURN: sensor0 only → spin to RIGHT");
+            int ts = clamp_int(TURN_SPEED, 0, PWM_MAX_DUTY);
+            // izquierda atrás, derecha adelante → gira a la derecha
+            motor_set(LEDC_CHANNEL_0, PIN_MA2, -ts);
+            motor_set(LEDC_CHANNEL_1, PIN_MB2,  ts);
+            vTaskDelay(pdMS_TO_TICKS(TURN_45_MS));
+            // stop corto
+            motor_set(LEDC_CHANNEL_0, PIN_MA2, 0);
+            motor_set(LEDC_CHANNEL_1, PIN_MB2, 0);
+            // reset PID
+            pid.integral  = 0.0f;
+            pid.prev_error = 0.0f;
+            continue;
+        }
 
-        // Ajuste PID dinámico
+        /* ===== CÁLCULO DE ERROR ===== */
+        float pos   = (act > 0) ? ((float)sum / act) : 5 * last_dir;
+        float error = -pos;
+        last_dir    = (error > 0) ? 1 : -1;
+
+        /* ===== PID DINÁMICO ===== */
         float kp_dynamic = KP_BASE;
         float kd_dynamic = KD_BASE;
 
-        if (only_leftmost) {
-            // Refuerzo agresivo si solo I0 detecta
-            kp_dynamic *= 4.2f;
-            kd_dynamic *= 5.2f;
-            ESP_LOGW(TAG, "⚠️ Solo I0 activo — giro forzado a la izquierda");
-        } else if (fabs(error) > 2.5f) {
+        if (fabsf(error) > 2.5f) {
             kp_dynamic *= 1.2f;
             kd_dynamic *= 1.4f;
-        } else if (fabs(error) > 4.0f) {
+        }
+        if (fabsf(error) > 4.0f) {
             kp_dynamic *= 1.4f;
             kd_dynamic *= 1.6f;
         }
 
-        // PID
+        /* PID core */
         pid.integral += error * dt;
         float deriv = (error - pid.prev_error) / dt;
         pid.prev_error = error;
 
-        float correction = kp_dynamic * error + KI_BASE * pid.integral + kd_dynamic * deriv;
+        float correction = kp_dynamic * error
+                         + KI_BASE * pid.integral
+                         + kd_dynamic * deriv;
 
-        int L = clamp_int(base_speed - (int)correction, -PWM_MAX_DUTY, PWM_MAX_DUTY);
-        int R = clamp_int(base_speed + (int)correction, -PWM_MAX_DUTY, PWM_MAX_DUTY);
+        int L = clamp_int(base_speed - (int)correction,
+                          -PWM_MAX_DUTY, PWM_MAX_DUTY);
+        int R = clamp_int(base_speed + (int)correction,
+                          -PWM_MAX_DUTY, PWM_MAX_DUTY);
 
-        // Suaviza cuando hay pocos sensores
-        if (black_count <= 2) { L *= 0.85f; R *= 0.85f; }
+        // suaviza si ve poquitos
+        if (black_count <= 2) {
+            L = (int)(L * 0.85f);
+            R = (int)(R * 0.85f);
+        }
 
         motor_set(LEDC_CHANNEL_0, PIN_MA2, L);
         motor_set(LEDC_CHANNEL_1, PIN_MB2, R);
 
-        if (tick++ % 5 == 0) telemetry_send(tick, error, L, R, black_count);
+        if (tick++ % 5 == 0) {
+            telemetry_send(tick, error, L, R, black_count);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(DT_MS));
     }
