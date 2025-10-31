@@ -33,6 +33,9 @@ static const char *TAG = "LFR_PID_V3";
 #define PWM_RES_BITS 10
 #define PWM_MAX_DUTY ((1 << PWM_RES_BITS) - 1)
 #define DT_MS 20
+/* Timed in-place turn to approximate 45 degrees — tuneable */
+#define TURN_45_MS 250
+#define TURN_SPEED (PWM_MAX_DUTY * 9 / 10)
 
 /* ---------- SENSOR CONFIG ---------- */
 #define LINE_THRESHOLD 1650
@@ -204,6 +207,27 @@ void app_main(void) {
             ESP_LOGW(TAG, "STOP: black sensors=%d", black_count);
             vTaskDelay(pdMS_TO_TICKS(200));
             stop_count = 0;
+            continue;
+        }
+
+        /* Special-case: if only sensor 0 detects the line, perform a very
+         * sharp in-place turn (left forward, right backward) to quickly
+         * rotate the robot approximately 45 degrees. This is a timed, open-loop
+         * maneuver — tune TURN_45_MS and TURN_SPEED as needed. */
+        if (blk[0] && black_count == 1) {
+            ESP_LOGW(TAG, "SHARP TURN: sensor0 only (black_count=1)");
+            int ts = clamp_int(TURN_SPEED, 0, PWM_MAX_DUTY);
+            /* left wheel forward, right wheel backward -> turn right */
+            motor_set(LEDC_CHANNEL_0, PIN_MA2, -ts);
+            motor_set(LEDC_CHANNEL_1, PIN_MB2, ts);
+            vTaskDelay(pdMS_TO_TICKS(TURN_45_MS));
+            /* stop and give a short settle */
+            motor_set(LEDC_CHANNEL_0, PIN_MA2, 0);
+            motor_set(LEDC_CHANNEL_1, PIN_MB2, 0);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            /* reset PID internal state to avoid immediate overshoot */
+            pid.integral = 0.0f;
+            pid.prev_error = 0.0f;
             continue;
         }
 
