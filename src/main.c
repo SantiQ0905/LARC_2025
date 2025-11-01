@@ -199,9 +199,9 @@ void app_main(void) {
     int base_speed;
     int stop_confirm_threshold;
     if (!dip1 && !dip2) {
-        // Ambos ON → velocidad máxima
+        // Ambos ON → velocidad máxima, stop rápido
         base_speed = 980;
-        stop_confirm_threshold = STOP_CONFIRM_COUNT;  // Stop normal (3)
+        stop_confirm_threshold = 2;  // Stop más rápido
         ESP_LOGI(TAG, "DIP Mode: ON-ON → Speed: 980, Stop: %d", stop_confirm_threshold);
     } else if (dip1 && dip2) {
         // Ambos OFF → velocidad media, stop más lento
