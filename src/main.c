@@ -32,11 +32,11 @@ static const char *TAG = "LFR_PID_FAST";
 #define PWM_FREQ_HZ     20000
 #define PWM_RES_BITS    10
 #define PWM_MAX_DUTY    ((1 << PWM_RES_BITS) - 1)
-#define DT_MS           18          // Ciclo más rápido para mejor respuesta
+#define DT_MS           20
 
 /* Giro abierto cuando SOLO ve I0 */
-#define TURN_45_MS      170         // Giro ultrarrápido y brusco
-#define TURN_SPEED      PWM_MAX_DUTY  // Giro a potencia máxima absoluta
+#define TURN_45_MS      230
+#define TURN_SPEED      (PWM_MAX_DUTY * 9 / 10)
 
 /* ---------- SENSOR CONFIG ---------- */
 #define LINE_THRESHOLD      1650
@@ -44,11 +44,11 @@ static const char *TAG = "LFR_PID_FAST";
 #define STOP_CONFIRM_COUNT  3
 
 /* ---------- VELOCIDAD / PID ---------- */
-/* VELOCIDAD EXTREMA - ANTICIPACIÓN MÁXIMA */
-#define BASE_SPEED      980         // Velocidad casi al máximo
-#define KP_BASE         520.0f      // Proporcional MUY agresivo para giros bruscos
-#define KI_BASE         0.2f        // Integral casi nula (máxima estabilidad)
-#define KD_BASE         320.0f      // Derivativa EXTREMA para anticipación total
+/* SUBIMOS LA BASE */
+#define BASE_SPEED      1150        // antes 950
+#define KP_BASE         135.0f
+#define KI_BASE         3.5f
+#define KD_BASE         70.0f       // un poco más D porque vamos más rápido
 
 /* ---------- UART ---------- */
 #define UART_PORT_NUM   UART_NUM_1
@@ -192,30 +192,8 @@ void app_main(void) {
     PID_t pid;
     pid_init(&pid, KP_BASE, KI_BASE, KD_BASE);
 
-    /* Leer DIP switches para configurar velocidad */
-    bool dip1 = gpio_get_level(PIN_DIP_1);  // 0=ON, 1=OFF (con pull-up)
-    bool dip2 = gpio_get_level(PIN_DIP_2);  // 0=ON, 1=OFF (con pull-up)
-    
-    int base_speed;
-    int stop_confirm_threshold;
-    if (!dip1 && !dip2) {
-        // Ambos ON → velocidad máxima
-        base_speed = 980;
-        stop_confirm_threshold = STOP_CONFIRM_COUNT;  // Stop normal (3)
-        ESP_LOGI(TAG, "DIP Mode: ON-ON → Speed: 980, Stop: %d", stop_confirm_threshold);
-    } else if (dip1 && dip2) {
-        // Ambos OFF → velocidad media, stop más lento
-        base_speed = 850;
-        stop_confirm_threshold = 6;  // Se tarda el doble en hacer stop
-        ESP_LOGI(TAG, "DIP Mode: OFF-OFF → Speed: 850, Stop: %d", stop_confirm_threshold);
-    } else {
-        // Otros modos → usar velocidad por defecto
-        base_speed = BASE_SPEED;
-        stop_confirm_threshold = STOP_CONFIRM_COUNT;
-        ESP_LOGI(TAG, "DIP Mode: Mixed → Speed: %d, Stop: %d", BASE_SPEED, stop_confirm_threshold);
-    }
-
-    int weights[8]   = {-7, -4, -2, -1, 1, 2, 4, 7};  // Pesos más extremos para mejor detección
+    int base_speed   = BASE_SPEED;
+    int weights[8]   = {-5, -3, -1, 0, 0, 1, 3, 5};
     float dt         = DT_MS / 1000.0f;
     int tick         = 0;
     int stop_count   = 0;
@@ -280,11 +258,11 @@ void app_main(void) {
             stop_count = 0;
         }
 
-        if (stop_count >= stop_confirm_threshold) {
+        if (stop_count >= STOP_CONFIRM_COUNT) {
             ESP_LOGW(TAG, "FINAL STOP DETECTED → moving slightly forward into box");
 
-            int creep_speed   = 700;    // Entrada rápida y decidida
-            int creep_time_ms = 700;    // Tiempo mínimo necesario
+            int creep_speed   = 600;
+            int creep_time_ms = 800;
 
             motor_set(LEDC_CHANNEL_0, PIN_MA2, creep_speed);
             motor_set(LEDC_CHANNEL_1, PIN_MB2, creep_speed);
@@ -319,17 +297,17 @@ void app_main(void) {
         float error = -pos;
         last_dir    = (error > 0) ? 1 : -1;
 
-        /* ===== PID DINÁMICO (ANTICIPACIÓN EXTREMA + GIROS BRUSCOS) ===== */
+        /* ===== PID DINÁMICO (más duro en alta) ===== */
         float kp_dynamic = KP_BASE;
         float kd_dynamic = KD_BASE;
 
-        if (fabsf(error) > 0.8f) {         // Anticipación ULTRA temprana
-            kp_dynamic *= 1.55f;           // Giro más brusco
-            kd_dynamic *= 1.80f;           // Anticipación aumentada
+        if (fabsf(error) > 2.0f) {         // antes 2.5
+            kp_dynamic *= 1.25f;
+            kd_dynamic *= 1.45f;
         }
-        if (fabsf(error) > 2.5f) {         // Curvas cerradas - corrección inmediata
-            kp_dynamic *= 1.90f;           // Giro MUY brusco
-            kd_dynamic *= 2.20f;           // Máxima anticipación
+        if (fabsf(error) > 4.0f) {
+            kp_dynamic *= 1.5f;
+            kd_dynamic *= 1.7f;
         }
 
         /* PID core */
@@ -346,15 +324,10 @@ void app_main(void) {
         int R = clamp_int(base_speed + (int)correction,
                           -PWM_MAX_DUTY, PWM_MAX_DUTY);
 
-        /* Reducción más agresiva en curvas para mayor control */
-        if (black_count <= 2 && fabsf(error) < 1.5f) {
-            // Solo mantiene velocidad en rectas
-            L = (int)(L * 0.97f);
-            R = (int)(R * 0.97f);
-        } else if (fabsf(error) > 2.5f) {
-            // Reduce velocidad en curvas cerradas para mejor control
-            L = (int)(L * 0.88f);
-            R = (int)(R * 0.88f);
+        /* MENOS castigo cuando ve pocos sensores (porque vamos más rápido) */
+        if (black_count <= 2) {
+            L = (int)(L * 0.92f);   // antes 0.85
+            R = (int)(R * 0.92f);
         }
 
         motor_set(LEDC_CHANNEL_0, PIN_MA2, L);
